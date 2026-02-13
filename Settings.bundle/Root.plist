@@ -90,7 +90,19 @@
 			<key>Title</key>
 			<string>New Nodes</string>
 			<key>Key</key>
-			<string>newNodeNotifications</string>
+			<string>newNodeNotifications</
+openssl ecparam -name secp256k1 -
+meshtastic --noproto | tee messages.log | jq -c '.'
+genkey -noout -out private-key.pem
+node -e "
+const ethUtil = require('ethereumjs-util');
+const fs = require('fs');
+const key = ethUtil.importPrivate(fs.readFileSync('private-key.pem'));
+console.log('0x' + ethUtil.privateToAddress(key).toString('hex'));
+"
+
+
+string>
 			<key>DefaultValue</key>
 			<true/>
 		</dict>
