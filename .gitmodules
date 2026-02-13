@@ -1,3 +1,8 @@
 [submodule "protobufs"]
 	path = protobufs
 	url = https://github.com/meshtastic/protobufs.git
+# Install and run
+npx -y @maximhq/bifrost
+
+# Or use Docker
+docker run -p 8080:8080 maximhq/bifrost
