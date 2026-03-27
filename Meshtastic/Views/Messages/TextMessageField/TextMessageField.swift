@@ -5,11 +5,12 @@ import DatadogSessionReplay
 struct TextMessageField: View {
 	static let maxbytes = 200
 	@EnvironmentObject var accessoryManager: AccessoryManager
+	@Environment(\.horizontalSizeClass) var horizontalSizeClass
+	@Environment(\.dismiss) var dismiss
 
 	let destination: MessageDestination
 	@Binding var replyMessageId: Int64
 	@FocusState.Binding var isFocused: Bool
-	let onSubmit: () -> Void
 
 	@State private var typingMessage: String = ""
 	@State private var totalBytes = 0
@@ -17,87 +18,88 @@ struct TextMessageField: View {
 
 	var body: some View {
 		SessionReplayPrivacyView(textAndInputPrivacy: .maskAllInputs) {
-			VStack {
-#if targetEnvironment(macCatalyst)
-				HStack {
-					if destination.showAlertButton {
-						Spacer()
-						AlertButton { typingMessage += "🔔 Alert Bell! \u{7}" }
-					}
-					Spacer()
-					RequestPositionButton(action: requestPosition)
-					TextMessageSize(maxbytes: Self.maxbytes, totalBytes: totalBytes).padding(.trailing)
-				}
-#endif
-				
-				HStack(alignment: .top) {
-					if replyMessageId != 0 {
-						HStack {
-							Button {
-								withAnimation(.easeInOut(duration: 0.2)) {
-									replyMessageId = 0
-								}
-								isFocused = false
-							} label: {
-								Image(systemName: "x.circle.fill")
+			VStack(spacing: 0) {
+				HStack(alignment: .bottom) {
+					if replyMessageId != 0 || isFocused {
+						Button {
+							withAnimation(.easeInOut(duration: 0.2)) {
+								replyMessageId = 0
 							}
-							Text("Reply")
+							isFocused = false
+						} label: {
+							Image(systemName: "x.circle.fill")
+								.font(.largeTitle)
 						}
-						.padding(.top)
+						if replyMessageId != 0 {
+							Text("Reply")
+								.padding(.bottom, 10)
+						}
 					}
-					
-					ZStack {
-						TextField("Message", text: $typingMessage, axis: .vertical)
-							.onChange(of: typingMessage) { _, value in
-								totalBytes = value.utf8.count
-								while totalBytes > Self.maxbytes {
-									typingMessage = String(typingMessage.dropLast())
-									totalBytes = typingMessage.utf8.count
-								}
+					TextField("Message", text: $typingMessage, axis: .vertical)
+						.padding(10)
+						.background(
+							RoundedRectangle(cornerRadius: 20)
+								.strokeBorder(.tertiary, lineWidth: 1)
+								.background(RoundedRectangle(cornerRadius: 20).fill(Color(.systemBackground)))
+						)
+						.clipShape(RoundedRectangle(cornerRadius: 20))
+						.onChange(of: typingMessage) { _, value in
+							totalBytes = value.utf8.count
+							while totalBytes > Self.maxbytes {
+								typingMessage = String(typingMessage.dropLast())
+								totalBytes = typingMessage.utf8.count
 							}
-							.keyboardType(.default)
-							.toolbar {
-								ToolbarItemGroup(placement: .keyboard) {
-									Button("Dismiss") {
-										isFocused = false
-									}
-									.font(.subheadline)
-									
-									if destination.showAlertButton {
-										Spacer()
-										AlertButton { typingMessage += "🔔 Alert Bell Character! \u{7}" }
-									}
-									
-									Spacer()
-									RequestPositionButton(action: requestPosition)
-									TextMessageSize(maxbytes: Self.maxbytes, totalBytes: totalBytes)
-								}
-							}
-							.padding(.horizontal, 8)
-							.focused($isFocused)
-							.multilineTextAlignment(.leading)
-							.frame(minHeight: 50)
-							.keyboardShortcut(.defaultAction)
-							.onSubmit {
+						}
+						.keyboardType(.default)
+						.focused($isFocused)
+						.multilineTextAlignment(.leading)
+						.onSubmit {
+							
 #if targetEnvironment(macCatalyst)
-								sendMessage()
+							sendMessage()
 #endif
-							}
-						
-						Text(typingMessage)
-							.opacity(0)
-							.padding(.all, 0)
-					}
-					.overlay(RoundedRectangle(cornerRadius: 20).stroke(.tertiary, lineWidth: 1))
-					.padding(.bottom, 15)
-					
-					Button(action: sendMessage) {
-						Image(systemName: "arrow.up.circle.fill")
-							.font(.largeTitle)
-							.foregroundColor(.accentColor)
+						}
+						.foregroundColor(.primary)
+					if !typingMessage.isEmpty {
+						Button(action: sendMessage) {
+							Image(systemName: "arrow.up.circle.fill")
+								.font(.largeTitle)
+								.foregroundColor(.accentColor)
+						}
 					}
 				}
-				.padding(.all, 15)
+				.padding(15)
+				if isFocused {
+					if #available(iOS 26.0, macOS 26.0, *) {
+						HStack {
+							Spacer()
+							AlertButton { typingMessage += "🔔 Alert Bell Character! \u{7}" }
+							Spacer()
+							RequestPositionButton(action: requestPosition)
+							Spacer()
+							TextMessageSize(maxbytes: Self.maxbytes, totalBytes: totalBytes)
+						}
+						.padding(.vertical, 8)
+						.padding(.horizontal)
+						.background(.ultraThinMaterial, in: Capsule())
+						Spacer()
+							.frame(height: 10)
+						
+					} else {
+						Divider()
+						HStack {
+							Spacer()
+							AlertButton { typingMessage += "🔔 Alert Bell Character! \u{7}" }
+							Spacer()
+							RequestPositionButton(action: requestPosition)
+							Spacer()
+							TextMessageSize(maxbytes: Self.maxbytes, totalBytes: totalBytes)
+						}
+						.padding(.horizontal, 15)
+						.padding(.vertical, 10)
+						.background(.bar)
+					}
+				}
 			}
 		}
 	}
@@ -118,11 +120,9 @@ struct TextMessageField: View {
 					isEmoji: false,
 					replyID: replyMessageId)
 
-				// If nothing thrown, then successful.  Reset for the next message
 				typingMessage = ""
 				isFocused = false
 				replyMessageId = 0
-				onSubmit()
 
 				if sendPositionWithMessage {
 					try await accessoryManager.sendPosition(
@@ -130,7 +130,6 @@ struct TextMessageField: View {
 						destNum: destination.positionDestNum,
 						wantResponse: destination.wantPositionResponse
 					)
-					// If nothing thrown, then successful.
 					Logger.mesh.info("Location Sent")
 				}
 			} catch {
@@ -152,13 +151,6 @@ private extension MessageDestination {
 		switch self {
 		case let .user(user): return user.num
 		case .channel: return Int64(Constants.maximumNodeNum)
-		}
-	}
-
-	var showAlertButton: Bool {
-		switch self {
-		case .user: return true
-		case .channel: return true
 		}
 	}
 

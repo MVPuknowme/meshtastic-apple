@@ -12,6 +12,7 @@ import MeshtasticProtobufs
 
 struct Settings: View {
 	@Environment(\.managedObjectContext) var context
+	@Environment(\.colorScheme) private var colorScheme
 	@EnvironmentObject var accessoryManager: AccessoryManager
 	@FetchRequest(
 		sortDescriptors: [
@@ -26,7 +27,6 @@ struct Settings: View {
 
 	@State private var selectedNode: Int = 0
 	@State private var preferredNodeNum: Int = 0
-	@State private var moduleOverride: Bool = false
 
 	@ObservedObject
 	var router: Router
@@ -34,7 +34,7 @@ struct Settings: View {
 	// MARK: Helper
 
 	private func isModuleSupported(_ module: ExcludedModules) -> Bool {
-		return moduleOverride || Int(nodes.first(where: { $0.num == preferredNodeNum })?.metadata?.excludedModules ?? Int32.zero) & module.rawValue == 0
+		return Int(nodes.first(where: { $0.num == preferredNodeNum })?.metadata?.excludedModules ?? Int32.zero) & module.rawValue == 0
 	}
 
 	private func isAnySupported(_ modules: [ExcludedModules]) -> Bool {
@@ -236,7 +236,7 @@ struct Settings: View {
 				}
 			}
 
-			if isModuleSupported(.audioConfig) {
+			if isModuleSupported(.extnotifConfig) {
 				NavigationLink(value: SettingsNavigationState.ringtone) {
 					Label {
 						Text("Ringtone")
@@ -287,10 +287,6 @@ struct Settings: View {
 			}
 		} header: {
 			Text("Module Configuration")
-		} footer: {
-			if moduleOverride {
-				Text("Currently showing modules that may not be supported by this node.")
-			}
 		}
 	}
 
@@ -328,6 +324,18 @@ struct Settings: View {
 				}
 			}
 			.disabled(selectedNode > 0 && selectedNode != preferredNodeNum)
+		}
+	}
+
+	var takSection: some View {
+		Section(header: Text("TAK")) {
+			NavigationLink(value: SettingsNavigationState.tak) {
+				Label {
+					Text("TAK Server")
+				} icon: {
+					Image(systemName: "target")
+				}
+			}
 		}
 	}
 
@@ -445,6 +453,8 @@ struct Settings: View {
 								}
 								TipView(AdminChannelTip(), arrowEdge: .top)
 									.tipViewStyle(PersistentTip())
+									.tipBackground(colorScheme == .dark ? Color(.systemBackground) : Color(.secondarySystemBackground))
+									.listRowSeparator(.hidden)
 							} else {
 								if accessoryManager.isConnected {
 									Text("Connected Node \(node?.user?.longName?.addingVariationSelectors ?? "Unknown".localized)")
@@ -460,6 +470,7 @@ struct Settings: View {
 					developersSection
 #endif
 					firmwareSection
+					takSection
 				}
 			}
 			.navigationDestination(for: SettingsNavigationState.self) { destination in
@@ -523,6 +534,8 @@ struct Settings: View {
 					AppData()
 				case .firmwareUpdates:
 					Firmware(node: node)
+				case .tak:
+					TAKServerConfig()
 				}
 			}
 			.onChange(of: UserDefaults.preferredPeripheralNum ) { _, newConnectedNode in
@@ -551,8 +564,6 @@ struct Settings: View {
 			.navigationTitle("Settings")
 			.navigationBarItems(
 				leading: MeshtasticLogo().onLongPressGesture(minimumDuration: 1.0) {
-					self.moduleOverride.toggle()
-					UIImpactFeedbackGenerator(style: .medium).impactOccurred()
 				}
 			)
 		}

@@ -29,7 +29,6 @@ struct WaypointForm: View {
 	@State private var expire: Date = Date.now.addingTimeInterval(60 * 480) // 1 minute * 480 = 8 Hours
 	@State private var locked: Bool = false
 	@State private var lockedTo: Int64 = 0
-	@State private var detents: Set<PresentationDetent> = [.medium, .fraction(0.85)]
 	@State private var selectedDetent: PresentationDetent = .medium
 	@State private var waypointFailedAlert: Bool = false
 
@@ -40,21 +39,21 @@ struct WaypointForm: View {
 					.font(.largeTitle)
 				Divider()
 				Form {
-					let distance = CLLocation(latitude: LocationsHandler.currentLocation.latitude, longitude: LocationsHandler.currentLocation.longitude).distance(from: CLLocation(latitude: waypoint.coordinate.latitude, longitude: waypoint.coordinate.longitude ))
-					Section(header: Text("Coordinate") ) {
-						HStack {
-							Text("Location:")
-								.foregroundColor(.secondary)
-							Text("\(String(format: "%.5f", waypoint.coordinate.latitude) + "," + String(format: "%.5f", waypoint.coordinate.longitude))")
-								.textSelection(.enabled)
-								.foregroundColor(.secondary)
-								.font(.caption)
-
-						}
+					if let cl = LocationsHandler.currentLocation {
+						let distance = CLLocation(latitude: cl.latitude, longitude: cl.longitude).distance(from: CLLocation(latitude: waypoint.coordinate.latitude, longitude: waypoint.coordinate.longitude ))
+						Section(header: Text("Coordinate") ) {
+							HStack {
+								Text("Location:")
+									.foregroundColor(.secondary)
+								Text("\(String(format: "%.5f", waypoint.coordinate.latitude) + "," + String(format: "%.5f", waypoint.coordinate.longitude))")
+									.textSelection(.enabled)
+									.foregroundColor(.secondary)
+									.font(.caption)
+								
+							}
 							Button {
-								let currentLoc = LocationsHandler.currentLocation
-								waypoint.coordinate.longitude = currentLoc.longitude
-								waypoint.coordinate.latitude = currentLoc.latitude
+								waypoint.coordinate.longitude = cl.longitude
+								waypoint.coordinate.latitude = cl.latitude
 							} label: {
 								HStack {
 									Text("Use my Location")
@@ -62,10 +61,11 @@ struct WaypointForm: View {
 								}
 							}
 							.accessibilityLabel("Set to current location")
-						HStack {
-							if waypoint.coordinate.latitude != 0 && waypoint.coordinate.longitude != 0 {
-								DistanceText(meters: distance)
-									.foregroundColor(Color.gray)
+							HStack {
+								if waypoint.coordinate.latitude != 0 && waypoint.coordinate.longitude != 0 {
+									DistanceText(meters: distance)
+										.foregroundColor(Color.gray)
+								}
 							}
 						}
 					}
@@ -110,26 +110,19 @@ struct WaypointForm: View {
 						HStack {
 							Text("Icon")
 							Spacer()
-							EmojiOnlyTextField(text: $icon, placeholder: "Select an emoji")
+							TextField("Select an emoji", text: $icon)
+								.keyboardType(.emoji)
 								.font(.title)
 								.focused($iconIsFocused)
 								.onChange(of: icon) { _, value in
-
-									// If you have anything other than emojis in your string make it empty
-									if !value.onlyEmojis() {
-										icon = ""
-									}
 									// If a second emoji is entered delete the first one
 									if value.count >= 1 {
-
 										if value.count > 1 {
 											let index = value.index(value.startIndex, offsetBy: 1)
 											icon = String(value[index])
 										}
-										iconIsFocused = false
 									}
 								}
-
 						}
 						Toggle(isOn: $expires) {
 							Label("Expires", systemImage: "clock.badge.xmark")
@@ -374,17 +367,19 @@ struct WaypointForm: View {
 							.padding(.bottom, 5)
 						}
 						/// Distance
-						if LocationsHandler.currentLocation.distance(from: LocationsHandler.DefaultLocation) > 0.0 {
-							let metersAway = waypoint.coordinate.distance(from: LocationsHandler.currentLocation)
-							Label {
-								Text("Distance".localized + ": \(distanceFormatter.string(fromDistance: Double(metersAway)))")
-									.foregroundColor(.primary)
-							} icon: {
-								Image(systemName: "lines.measurement.horizontal")
-									.symbolRenderingMode(.hierarchical)
-									.frame(width: 35)
+						if let cl = LocationsHandler.currentLocation {
+							if cl.distance(from: cl) > 0.0 {
+								let metersAway = waypoint.coordinate.distance(from: cl)
+								Label {
+									Text("Distance".localized + ": \(distanceFormatter.string(fromDistance: Double(metersAway)))")
+										.foregroundColor(.primary)
+								} icon: {
+									Image(systemName: "lines.measurement.horizontal")
+										.symbolRenderingMode(.hierarchical)
+										.frame(width: 35)
+								}
+								.padding(.bottom, 5)
 							}
-							.padding(.bottom, 5)
 						}
 					}
 					.padding(.top)
@@ -455,7 +450,6 @@ struct WaypointForm: View {
 				longitude = waypoint.coordinate.longitude
 			}
 		}
-		.presentationDetents(detents, selection: $selectedDetent)
 		.presentationBackgroundInteraction(.enabled(upThrough: .fraction(0.85)))
 		.presentationDragIndicator(.visible)
 	}

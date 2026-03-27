@@ -47,6 +47,43 @@ extension AccessoryManager {
 			try await send(toRadio, debugDescription: logString)
 		}
 	}
+	
+	public func getRingtone(destNum: Int64, wantResponse: Bool) throws {
+		guard let deviceNum = self.activeConnection?.device.num else {
+			Logger.services.error("Error while sending RtttlConfig request.  No active device.")
+			throw AccessoryError.ioFailed("No active device")
+		}
+
+		var adminPacket = AdminMessage()
+		adminPacket.getRingtoneRequest = true
+
+		var meshPacket: MeshPacket = MeshPacket()
+		meshPacket.to = UInt32(destNum)
+		meshPacket.from	= UInt32(deviceNum)
+		meshPacket.id = UInt32.random(in: UInt32(UInt8.max)..<UInt32.max)
+		meshPacket.priority =  MeshPacket.Priority.reliable
+		meshPacket.wantAck = true
+		meshPacket.decoded.wantResponse = wantResponse
+
+		var dataMessage = DataMessage()
+		guard let adminData: Data = try? adminPacket.serializedData() else {
+			throw AccessoryError.ioFailed("Error serializing admin packet")
+		}
+		dataMessage.payload = adminData
+		dataMessage.portnum = PortNum.adminApp
+		dataMessage.wantResponse = wantResponse
+
+		meshPacket.decoded = dataMessage
+
+		var toRadio: ToRadio!
+		toRadio = ToRadio()
+		toRadio.packet = meshPacket
+
+		let logString = String.localizedStringWithFormat("Requested RTTTL Config Module ringtone for node: %@".localized, String(deviceNum))
+		Task {
+			try await send(toRadio, debugDescription: logString)
+		}
+	}
 
 	public func saveTimeZone(config: Config.DeviceConfig, user: Int64) async throws -> Int64 {
 		var adminPacket = AdminMessage()
@@ -128,15 +165,9 @@ extension AccessoryManager {
 					nodeMeshPacket.decoded = dataNodeMessage
 
 					// Update local database with the new node info
-					upsertNodeInfoPacket(packet: nodeMeshPacket, context: context)
+					// FUTURE: after https://github.com/meshtastic/firmware/pull/8495 is merged, `favorite: true` becomes `favorite: (connectedDeviceRole != DeviceRoles.clientBase)`
+					await MeshPackets.shared.upsertNodeInfoPacket(packet: nodeMeshPacket, favorite: true)
 				}
-
-				// Refresh the config from the node, in a background task
-				Task {
-					Logger.transport.debug("[AccessoryManager] sending wantConfig for addContactFromURL")
-					try? await sendWantConfig()
-				}
-
 			} catch {
 				Logger.data.error("Failed to decode contact data: \(error.localizedDescription, privacy: .public)")
 				throw AccessoryError.appError("Unable to decode contact data from QR code.")
@@ -296,35 +327,33 @@ extension AccessoryManager {
 					if newMessage.toUser?.pkiEncrypted ?? false {
 						meshPacket.pkiEncrypted = true
 						meshPacket.publicKey = newMessage.toUser?.publicKey ?? Data()
-						// Auto Favorite nodes you DM so they don't roll out of the nodedb
-						if !(newMessage.toUser?.userNode?.favorite ?? true) {
-							newMessage.toUser?.userNode?.favorite = true
-							do {
-								try context.save()
-								Logger.data.info("💾 Auto favorited node based on sending a message \(self.activeDeviceNum?.toHex() ?? "0", privacy: .public) to \(toUserNum.toHex(), privacy: .public)")
-
-								guard let userNode = newMessage.toUser?.userNode else {
-									Logger.data.warning("⚠️ Unable to set favorite node: userNode is nil.")
-									return
+						// Send a contact to the phone every time we send a dm so that any nodes that have rolled out of the db are there and we don't get a PKI Failed error
+						Task { @MainActor in
+							let am = AccessoryManager.shared
+							if let user = newMessage.toUser {
+								var contact = SharedContact()
+								contact.manuallyVerified = false
+								contact.nodeNum = UInt32(truncatingIfNeeded: user.num)
+								user.userNode?.favorite = user.userNode?.deviceConfig?.role ?? 0 != DeviceRoles.clientBase.rawValue
+								contact.user = user.toProto()
+								do {
+									let contactString = try contact.serializedData().base64EncodedString()
+									try? await am.addContactFromURL(base64UrlString: contactString)
+									try context.save()
+									user.objectWillChange.send()
+								} catch {
+									Logger.services.error("Error inserting new contact and resending encrypted send failed message: \(error)")
 								}
-								Task {
-									do {
-										try await self.setFavoriteNode(node: userNode, connectedNodeNum: fromUserNum)
-									} catch {
-										Logger.data.warning("⚠️ Unable to set favorite node: userNode is nil.")
-										return
-									}
-								}
-							} catch {
-								context.rollback()
-								let nsError = error as NSError
-								Logger.data.error("Unresolved Core Data error when auto favoriting in Send Message Function. Error: \(nsError, privacy: .public)")
 							}
 						}
 					}
 					meshPacket.id = UInt32(newMessage.messageId)
 					if toUserNum > 0 {
 						meshPacket.to = UInt32(toUserNum)
+						let hopsAway = newMessage.toUser?.userNode?.hopsAway ?? 0
+						if hopsAway > Int32(truncatingIfNeeded: newMessage.fromUser?.userNode?.loRaConfig?.hopLimit ?? 0) {
+							meshPacket.hopLimit = UInt32(truncatingIfNeeded: hopsAway)
+						}
 					} else {
 						meshPacket.to = Constants.maximumNodeNum
 					}
@@ -412,8 +441,6 @@ extension AccessoryManager {
 			Logger.services.error("Error while sending saveChannelSet request.  No active device.")
 			throw AccessoryError.ioFailed("No active device")
 		}
-		var i: Int32 = 0
-		var myInfo: MyInfoEntity
 		// Before we get started delete the existing channels from the myNodeInfo
 		if !addChannels {
 			tryClearExistingChannels()
@@ -422,45 +449,80 @@ extension AccessoryManager {
 		let decodedString = base64UrlString.base64urlToBase64()
 		if let decodedData = Data(base64Encoded: decodedString) {
 			let channelSet: ChannelSet = try ChannelSet(serializedBytes: decodedData)
+
+			var myInfo: MyInfoEntity!
+			var i: Int32 = 0
+
+			if addChannels {
+				let fetchMyInfoRequest = MyInfoEntity.fetchRequest()
+				fetchMyInfoRequest.predicate = NSPredicate(format: "myNodeNum == %lld", Int64(deviceNum))
+
+				let fetchedMyInfo = try context.fetch(fetchMyInfoRequest)
+				if fetchedMyInfo.count != 1 {
+					throw AccessoryError.appError("MyInfo not found")
+				}
+				
+				// We are trying to add a channel so lets get the last index
+				myInfo = fetchedMyInfo[0]
+				i = Int32(myInfo.channels?.count ?? -1)
+				
+				// Bail out if the index is negative or bigger than our max of 8
+				if i < 0 || i > 8 {
+					throw AccessoryError.appError("Index out of range \(i)")
+				}
+			}
+
 			for cs in channelSet.settings {
+
 				if addChannels {
-					// We are trying to add a channel so lets get the last index
-					let fetchMyInfoRequest = MyInfoEntity.fetchRequest()
-					fetchMyInfoRequest.predicate = NSPredicate(format: "myNodeNum == %lld", Int64(deviceNum))
-					do {
-						let fetchedMyInfo = try context.fetch(fetchMyInfoRequest)
-						if fetchedMyInfo.count == 1 {
-							i = Int32(fetchedMyInfo[0].channels?.count ?? -1)
-							myInfo = fetchedMyInfo[0]
-							// Bail out if the index is negative or bigger than our max of 8
-							if i < 0 || i > 8 {
-								throw AccessoryError.appError("Index out of range \(i)")
-							}
-							// Bail out if there are no channels or if the same channel name already exists
-							guard let mutableChannels = myInfo.channels!.mutableCopy() as? NSMutableOrderedSet else {
-								throw AccessoryError.appError("No channels or channel")
-							}
-							if mutableChannels.first(where: {($0 as AnyObject).name == cs.name }) is ChannelEntity {
-								throw AccessoryError.appError("Channel already exists")
-							}
-						}
-					} catch {
-						Logger.data.error("Failed to find a node MyInfo to save these channels to: \(error.localizedDescription, privacy: .public)")
+					guard let mutableChannels = myInfo.channels?.mutableCopy() as? NSMutableOrderedSet else {
+						throw AccessoryError.appError("No channels or channel")
+					}
+					
+					// Bail out if there are no channels or if the same channel name already exists
+					if mutableChannels.first(where: { ($0 as AnyObject).name == cs.name }) is ChannelEntity {
+						throw AccessoryError.appError("Channel already exists")
 					}
 				}
 
 				var chan = Channel()
-				if i == 0 {
-					chan.role = Channel.Role.primary
-				} else {
-					chan.role = Channel.Role.secondary
-				}
+				chan.role = (i == 0) ? .primary : .secondary
 				chan.settings = cs
 				chan.index = i
 				i += 1
 
 				var adminPacket = AdminMessage()
 				adminPacket.setChannel = chan
+
+				var meshPacket = MeshPacket()
+				meshPacket.to = UInt32(deviceNum)
+				meshPacket.from = UInt32(deviceNum)
+				meshPacket.id = UInt32.random(in: UInt32(UInt8.max)..<UInt32.max)
+				meshPacket.priority = MeshPacket.Priority.reliable
+				meshPacket.wantAck = true
+				meshPacket.channel = 0
+
+				guard let adminData = try? adminPacket.serializedData() else {
+					throw AccessoryError.ioFailed("saveChannelSet: Unable to serialize Admin packet")
+				}
+
+				var dataMessage = DataMessage()
+				dataMessage.payload = adminData
+				dataMessage.portnum = PortNum.adminApp
+				meshPacket.decoded = dataMessage
+
+				var toRadio = ToRadio()
+				toRadio.packet = meshPacket
+
+				let logString = String.localizedStringWithFormat("Sent a Channel for: %@ Channel Index %d".localized, String(deviceNum), chan.index)
+				try await send(toRadio, debugDescription: logString)
+				await MeshPackets.shared.channelPacket(channel: chan, fromNum: self.activeDeviceNum ?? 0)
+			}
+			if !addChannels {
+				// Save the LoRa Config and the device will reboot
+				var adminPacket = AdminMessage()
+				adminPacket.setConfig.lora = channelSet.loraConfig
+				adminPacket.setConfig.lora.configOkToMqtt = okToMQTT // Preserve users okToMQTT choice
 				var meshPacket: MeshPacket = MeshPacket()
 				meshPacket.to = UInt32(deviceNum)
 				meshPacket.from	= UInt32(deviceNum)
@@ -468,45 +530,20 @@ extension AccessoryManager {
 				meshPacket.priority =  MeshPacket.Priority.reliable
 				meshPacket.wantAck = true
 				meshPacket.channel = 0
-				guard let adminData: Data = try? adminPacket.serializedData() else {
-					throw AccessoryError.ioFailed("saveChannelSet: Unable to serialize Admin packet")
-				}
 				var dataMessage = DataMessage()
+				guard let adminData: Data = try? adminPacket.serializedData() else {
+					throw AccessoryError.ioFailed("sendReboot: Unable to serialize Admin packet")
+				}
 				dataMessage.payload = adminData
 				dataMessage.portnum = PortNum.adminApp
 				meshPacket.decoded = dataMessage
 				var toRadio: ToRadio!
 				toRadio = ToRadio()
 				toRadio.packet = meshPacket
-				let logString = String.localizedStringWithFormat("Sent a Channel for: %@ Channel Index %d".localized, String(deviceNum), chan.index)
+				
+				let logString = String.localizedStringWithFormat("Sent a LoRa.Config for: %@".localized, String(deviceNum))
 				try await send(toRadio, debugDescription: logString)
 			}
-
-			// Save the LoRa Config and the device will reboot
-			var adminPacket = AdminMessage()
-			adminPacket.setConfig.lora = channelSet.loraConfig
-			adminPacket.setConfig.lora.configOkToMqtt = okToMQTT // Preserve users okToMQTT choice
-			var meshPacket: MeshPacket = MeshPacket()
-			meshPacket.to = UInt32(deviceNum)
-			meshPacket.from	= UInt32(deviceNum)
-			meshPacket.id = UInt32.random(in: UInt32(UInt8.max)..<UInt32.max)
-			meshPacket.priority =  MeshPacket.Priority.reliable
-			meshPacket.wantAck = true
-			meshPacket.channel = 0
-			var dataMessage = DataMessage()
-			guard let adminData: Data = try? adminPacket.serializedData() else {
-				throw AccessoryError.ioFailed("sendReboot: Unable to serialize Admin packet")
-			}
-			dataMessage.payload = adminData
-			dataMessage.portnum = PortNum.adminApp
-			meshPacket.decoded = dataMessage
-			var toRadio: ToRadio!
-			toRadio = ToRadio()
-			toRadio.packet = meshPacket
-
-			let logString = String.localizedStringWithFormat("Sent a LoRa.Config for: %@".localized, String(deviceNum))
-			try await send(toRadio, debugDescription: logString)
-
 			Logger.transport.debug("[AccessoryManager] sending wantConfig for saveChannelSet")
 			try await sendWantConfig()
 		}
@@ -827,7 +864,7 @@ extension AccessoryManager {
 
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertAmbientLightingModuleConfigPacket(config: config, nodeNum: toUser.num, context: context)
+		await MeshPackets.shared.upsertAmbientLightingModuleConfigPacket(config: config, nodeNum: toUser.num)
 
 		return Int64(meshPacket.id)
 
@@ -883,7 +920,7 @@ extension AccessoryManager {
 
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertCannedMessagesModuleConfigPacket(config: config, nodeNum: toUser.num, context: context)
+		await MeshPackets.shared.upsertCannedMessagesModuleConfigPacket(config: config, nodeNum: toUser.num)
 
 		return Int64(meshPacket.id)
 	}
@@ -966,7 +1003,7 @@ extension AccessoryManager {
 		let messageDescription = "🛟 Saved Detection Sensor Module Config for \(toUser.longName ?? "Unknown".localized)"
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertDetectionSensorModuleConfigPacket(config: config, nodeNum: toUser.num, context: context)
+		await MeshPackets.shared.upsertDetectionSensorModuleConfigPacket(config: config, nodeNum: toUser.num)
 
 		return Int64(meshPacket.id)
 	}
@@ -1020,7 +1057,7 @@ extension AccessoryManager {
 		let messageDescription = "🛟 Saved External Notification Module Config for \(toUser.longName ?? "Unknown".localized)"
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertExternalNotificationModuleConfigPacket(config: config, nodeNum: toUser.num, context: context)
+		await MeshPackets.shared.upsertExternalNotificationModuleConfigPacket(config: config, nodeNum: toUser.num)
 
 		return Int64(meshPacket.id)
 	}
@@ -1050,7 +1087,7 @@ extension AccessoryManager {
 		let messageDescription = "🛟 Saved PAX Counter Module Config for \(toUser.longName ?? "Unknown".localized)"
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertPaxCounterModuleConfigPacket(config: config, nodeNum: toUser.num, context: context)
+		await MeshPackets.shared.upsertPaxCounterModuleConfigPacket(config: config, nodeNum: toUser.num)
 
 		return Int64(meshPacket.id)
 	}
@@ -1080,7 +1117,7 @@ extension AccessoryManager {
 
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertRtttlConfigPacket(ringtone: ringtone, nodeNum: toUser.num, context: context)
+		await MeshPackets.shared.upsertRtttlConfigPacket(ringtone: ringtone, nodeNum: toUser.num)
 
 		return Int64(meshPacket.id)
 	}
@@ -1111,7 +1148,7 @@ extension AccessoryManager {
 		let messageDescription = "🛟 Saved MQTT Config for \(toUser.longName ?? "Unknown".localized)"
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertMqttModuleConfigPacket(config: config, nodeNum: toUser.num, context: context)
+		await MeshPackets.shared.upsertMqttModuleConfigPacket(config: config, nodeNum: toUser.num)
 
 		return Int64(meshPacket.id)
 	}
@@ -1141,7 +1178,7 @@ extension AccessoryManager {
 
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertRangeTestModuleConfigPacket(config: config, nodeNum: toUser.num, context: context)
+		await MeshPackets.shared.upsertRangeTestModuleConfigPacket(config: config, nodeNum: toUser.num)
 
 		return Int64(meshPacket.id)
 	}
@@ -1171,7 +1208,7 @@ extension AccessoryManager {
 		let messageDescription = "🛟 Saved Serial Module Config for \(toUser.longName ?? "Unknown".localized)"
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertSerialModuleConfigPacket(config: config, nodeNum: toUser.num, context: context)
+		await MeshPackets.shared.upsertSerialModuleConfigPacket(config: config, nodeNum: toUser.num)
 
 		return Int64(meshPacket.id)
 	}
@@ -1350,7 +1387,7 @@ extension AccessoryManager {
 		let messageDescription = "🛟 Saved Store & Forward Module Config for \(toUser.longName ?? "Unknown".localized)"
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertStoreForwardModuleConfigPacket(config: config, nodeNum: toUser.num, context: context)
+		await MeshPackets.shared.upsertStoreForwardModuleConfigPacket(config: config, nodeNum: toUser.num)
 
 		return Int64(meshPacket.id)
 	}
@@ -1586,7 +1623,7 @@ extension AccessoryManager {
 
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertPositionConfigPacket(config: config, nodeNum: toUser.num, context: context)
+		try await MeshPackets.shared.upsertPositionConfigPacket(config: config, nodeNum: toUser.num)
 
 		return Int64(meshPacket.id)
 	}
@@ -1640,7 +1677,7 @@ extension AccessoryManager {
 
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertPowerConfigPacket(config: config, nodeNum: toUser.num, context: context)
+		await MeshPackets.shared.upsertPowerConfigPacket(config: config, nodeNum: toUser.num)
 
 		return Int64(meshPacket.id)
 	}
@@ -1696,7 +1733,7 @@ extension AccessoryManager {
 
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertNetworkConfigPacket(config: config, nodeNum: toUser.num, context: context)
+		await MeshPackets.shared.upsertNetworkConfigPacket(config: config, nodeNum: toUser.num)
 
 		return Int64(meshPacket.id)
 	}
@@ -1727,7 +1764,7 @@ extension AccessoryManager {
 
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertSecurityConfigPacket(config: config, nodeNum: toUser.num, context: context)
+		await MeshPackets.shared.upsertSecurityConfigPacket(config: config, nodeNum: toUser.num)
 
 		return Int64(meshPacket.id)
 	}
@@ -1785,7 +1822,7 @@ extension AccessoryManager {
 
 	public func sendNodeDBReset(fromUser: UserEntity, toUser: UserEntity) async throws {
 		var adminPacket = AdminMessage()
-		adminPacket.nodedbReset = 5
+		adminPacket.nodedbReset = true
 		if fromUser != toUser {
 			adminPacket.sessionPasskey = toUser.userNode?.sessionPasskey ?? Data()
 		}
@@ -1861,7 +1898,7 @@ extension AccessoryManager {
 
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertBluetoothConfigPacket(config: config, nodeNum: toUser.num, sessionPasskey: toUser.userNode?.sessionPasskey, context: context)
+		await MeshPackets.shared.upsertBluetoothConfigPacket(config: config, nodeNum: toUser.num, sessionPasskey: toUser.userNode?.sessionPasskey)
 
 		return Int64(meshPacket.id)
 	}
@@ -1891,7 +1928,7 @@ extension AccessoryManager {
 		let messageDescription = "Saved Telemetry Module Config for \(toUser.longName ?? "Unknown".localized)"
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertTelemetryModuleConfigPacket(config: config, nodeNum: toUser.num, context: context)
+		await MeshPackets.shared.upsertTelemetryModuleConfigPacket(config: config, nodeNum: toUser.num)
 
 		return Int64(meshPacket.id)
 	}
@@ -1944,7 +1981,7 @@ extension AccessoryManager {
 		let messageDescription = "🛟 Saved Display Config for \(toUser.longName ?? "Unknown".localized)"
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertDisplayConfigPacket(config: config, nodeNum: toUser.num, sessionPasskey: toUser.userNode?.sessionPasskey, context: context)
+		await MeshPackets.shared.upsertDisplayConfigPacket(config: config, nodeNum: toUser.num, sessionPasskey: toUser.userNode?.sessionPasskey)
 
 		return Int64(meshPacket.id)
 	}
@@ -2023,7 +2060,7 @@ extension AccessoryManager {
 		let messageDescription = "🛟 Saved Device Config for \(toUser.longName ?? "Unknown".localized)"
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-			upsertDeviceConfigPacket(config: config, nodeNum: toUser.num, sessionPasskey: toUser.userNode?.sessionPasskey, context: context)
+		await MeshPackets.shared.upsertDeviceConfigPacket(config: config, nodeNum: toUser.num, sessionPasskey: toUser.userNode?.sessionPasskey)
 
 		return Int64(meshPacket.id)
 	}
@@ -2052,7 +2089,7 @@ extension AccessoryManager {
 
 		try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 
-		upsertLoRaConfigPacket(config: config, nodeNum: toUser.num, sessionPasskey: toUser.userNode?.sessionPasskey, context: context)
+		await MeshPackets.shared.upsertLoRaConfigPacket(config: config, nodeNum: toUser.num, sessionPasskey: toUser.userNode?.sessionPasskey)
 
 		return Int64(meshPacket.id)
 	}
@@ -2081,4 +2118,34 @@ extension AccessoryManager {
 
 			try await sendAdminMessageToRadio(meshPacket: meshPacket, adminDescription: messageDescription)
 		}
+
+	public func exchangeUserInfo(fromUser: UserEntity, toUser: UserEntity) async throws -> Int64 {
+
+		let userProto = fromUser.toProto()
+		guard let userPayload: Data = try? userProto.serializedData() else {
+			throw AccessoryError.ioFailed("exchangeUserInfo: Unable to serialize User protobuf")
+		}
+
+		var dataMessage = DataMessage()
+		dataMessage.payload = userPayload
+		dataMessage.portnum = PortNum.nodeinfoApp
+		dataMessage.wantResponse = true
+
+		var meshPacket: MeshPacket = MeshPacket()
+		meshPacket.to = UInt32(toUser.num)
+		meshPacket.from = UInt32(fromUser.num)
+		meshPacket.id = UInt32.random(in: UInt32(UInt8.max)..<UInt32.max)
+		meshPacket.priority = MeshPacket.Priority.reliable
+		meshPacket.wantAck = true
+		meshPacket.channel = UInt32(toUser.userNode?.channel ?? 0)
+		meshPacket.decoded = dataMessage
+
+		var toRadio: ToRadio = ToRadio()
+		toRadio.packet = meshPacket
+
+		let logString = String.localizedStringWithFormat("Sent User Info Exchange request from %@ to %@".localized, fromUser.longName ?? "Unknown".localized, toUser.longName ?? "Unknown".localized)
+		try await send(toRadio, debugDescription: logString)
+
+		return Int64(meshPacket.id)
+	}
 }

@@ -1,230 +1,137 @@
 //
-//  UserMessageList.swift
-//  MeshtasticApple
+//  UserMessageList.swift
+//  MeshtasticApple
 //
-//  Created by Garth Vander Houwen on 12/24/21.
+//  Created by Garth Vander Houwen on 12/24/21.
 //
 
 import SwiftUI
 import CoreData
 import OSLog
+import MeshtasticProtobufs // Added to ensure RoutingError is accessible if needed
 
 struct UserMessageList: View {
-
 	@EnvironmentObject var appState: AppState
 	@EnvironmentObject var accessoryManager: AccessoryManager
+	@Environment(\.scenePhase) var scenePhase
 	@Environment(\.managedObjectContext) var context
-	// Keyboard State
 	@FocusState var messageFieldFocused: Bool
-	// View State Items
 	@ObservedObject var user: UserEntity
 	@State private var replyMessageId: Int64 = 0
-	// Scroll state
-	@State private var showScrollToBottomButton = false
-	@State private var hasReachedBottom = false
-	@State private var gotFirstUnreadMessage: Bool = false
 	@State private var messageToHighlight: Int64 = 0
+	@State private var redrawTapbacksTrigger = UUID()
+	@AppStorage("preferredPeripheralNum") private var preferredPeripheralNum = -1
+	@FetchRequest private var allPrivateMessages: FetchedResults<MessageEntity>
+
+	init(user: UserEntity) {
+		self.user = user
+
+		// Configure fetch request here
+		let request: NSFetchRequest<MessageEntity> = user.messageFetchRequest
+		_allPrivateMessages = FetchRequest(fetchRequest: request)
+	}
+
+	func handleInteractionComplete() {
+		markMessagesAsRead()
+		redrawTapbacksTrigger = UUID()
+	}
+
+	func markMessagesAsRead() {
+		do {
+			for unreadMessage in allPrivateMessages.filter({ !$0.read }) {
+				unreadMessage.read = true
+			}
+			try context.save()
+			Logger.data.info("📖 [App] All unread direct messages marked as read for user \(user.num, privacy: .public).")
+
+			if let connectedPeripheralNum = accessoryManager.activeDeviceNum,
+			   let connectedNode = getNodeInfo(id: connectedPeripheralNum, context: context),
+			   let connectedUser = connectedNode.user {
+				appState.unreadDirectMessages = connectedUser.unreadMessages(context: context, skipLastMessageCheck: true) // skipLastMessageCheck=true because we don't update lastMessage on our own connected node
+			}
+
+			context.refresh(user, mergeChanges: true)
+		} catch {
+			Logger.data.error("Failed to read direct messages: \(error.localizedDescription, privacy: .public)")
+		}
+	}
+
+	private func routerIsShowingThisUser() -> Bool {
+		guard appState.router.navigationState.selectedTab == .messages else { return false }
+		return scenePhase == .active
+	}
 
 	var body: some View {
+		// Cast user.messageList to an array for easier indexing and ForEach.
+		let messages: [MessageEntity] = Array(allPrivateMessages)
+
+		// Precompute previous message
+		let previousByID: [Int64: MessageEntity?] = {
+			var dict = [Int64: MessageEntity?]()
+			var prev: MessageEntity?
+			for m in messages { dict[m.messageId] = prev; prev = m }
+			return dict
+		}()
+
 		VStack {
 			ScrollViewReader { scrollView in
-				ZStack(alignment: .bottomTrailing) {
-					ScrollView {
-						LazyVStack {
-							ForEach( Array(user.messageList.enumerated()), id: \.element.id) { index, message in
-								// Get the previous message, if it exists
-								let previousMessage = index > 0 ? user.messageList[index - 1] : nil
-								if message.displayTimestamp(aboveMessage: previousMessage) {
-									Text(message.timestamp.formatted(date: .abbreviated, time: .shortened))
-										.font(.caption)
-										.foregroundColor(.gray)
-								}
-								if user.num != accessoryManager.activeDeviceNum ?? -1 {
-									let currentUser: Bool = (Int64(UserDefaults.preferredPeripheralNum) == message.fromUser?.num ?? -1 ? true : false)
-
-									if message.replyID > 0 {
-										let messageReply = user.messageList.first(where: { $0.messageId == message.replyID })
-										HStack {
-											Button {
-												if let messageNum = messageReply?.messageId {
-													withAnimation(.easeInOut(duration: 0.5)) {
-														messageToHighlight = messageNum
-													}
-													scrollView.scrollTo(messageNum, anchor: .center)
-													// Reset highlight after delay
-													Task {
-														try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
-														withAnimation(.easeInOut(duration: 0.5)) {
-															messageToHighlight = -1
-														}
-													}
-												}
-											} label: {
-												Text(messageReply?.messagePayload ?? "EMPTY MESSAGE").foregroundColor(.accentColor).font(.caption2)
-													.padding(10)
-													.overlay(
-														RoundedRectangle(cornerRadius: 18)
-															.stroke(Color.blue, lineWidth: 0.5)
-													)
-												Image(systemName: "arrowshape.turn.up.left.fill")
-													.symbolRenderingMode(.hierarchical)
-													.imageScale(.large).foregroundColor(.accentColor)
-													.padding(.trailing)
-											}
-										}
-									}
-									HStack(alignment: .top) {
-										if currentUser { Spacer(minLength: 50) }
-										VStack(alignment: currentUser ? .trailing : .leading) {
-											HStack {
-												MessageText(
-													message: message,
-													tapBackDestination: .user(user),
-													isCurrentUser: currentUser
-												) {
-													self.replyMessageId = message.messageId
-													self.messageFieldFocused = true
-												}
-
-												if currentUser && message.canRetry || (message.receivedACK && !message.realACK) {
-													RetryButton(message: message, destination: .user(user))
-												}
-											}
-
-											TapbackResponses(message: message) {
-												appState.unreadDirectMessages = user.unreadMessages
-											}
-
-											HStack {
-												let ackErrorVal = RoutingError(rawValue: Int(message.ackError))
-												if currentUser && message.receivedACK {
-													// Ack Received
-													if message.realACK {
-														Text("\(ackErrorVal?.display ?? "Empty Ack Error")")
-															.font(.caption2)
-															.foregroundStyle(ackErrorVal?.color ?? Color.secondary)
-													} else {
-														Text("Acknowledged by another node").font(.caption2).foregroundColor(.orange)
-													}
-												} else if currentUser && message.ackError == 0 {
-													// Empty Error
-													Text("Waiting to be acknowledged. . .").font(.caption2).foregroundColor(.yellow)
-												} else if currentUser && message.ackError > 0 {
-													Text("\(ackErrorVal?.display ?? "Empty Ack Error")").fixedSize(horizontal: false, vertical: true)
-														.foregroundStyle(ackErrorVal?.color ?? Color.red)
-														.font(.caption2)
-												}
-											}
-										}
-										.padding(.bottom)
-										.id(user.messageList.firstIndex(of: message))
-
-										if !currentUser {
-											Spacer(minLength: 50)
-										}
-									}
-//									.overlay {
-//										RoundedRectangle(cornerRadius: 10)
-//											.stroke(.blue, lineWidth: 2)
-//											.opacity(((messageToHighlight  == message.messageId) || (replyMessageId == message.messageId)) ? 1 : 0)
-//									}
-									.padding([.leading, .trailing])
-									.frame(maxWidth: .infinity)
-									.id(message.messageId)
-									.onAppear {
-										if gotFirstUnreadMessage {
-											if !message.read {
-												message.read = true
-												do {
-													for unreadMessage in user.messageList.filter({ !$0.read }) {
-														unreadMessage.read = true
-													}
-													try context.save()
-													Logger.data.info("📖 [App] Read message \(message.messageId, privacy: .public) ")
-													appState.unreadDirectMessages = user.unreadMessages
-												} catch {
-													Logger.data.error("Failed to read message \(message.messageId, privacy: .public): \(error.localizedDescription, privacy: .public)")
-												}
-											}
-											// Check if we've reached the bottom message
-											if message.messageId == user.messageList.last?.messageId {
-												hasReachedBottom = true
-												showScrollToBottomButton = false
-											}
-										}
+				ScrollView {
+					LazyVStack {
+						ForEach(messages, id: \.messageId) { message in
+							let previousMessage: MessageEntity? = previousByID[message.messageId] ?? nil
+							
+							UserMessageRow(
+								message: message,
+								allMessages: messages,
+								previousMessage: previousMessage,
+								preferredPeripheralNum: preferredPeripheralNum,
+								user: user,
+								replyMessageId: $replyMessageId,
+								messageFieldFocused: $messageFieldFocused,
+								messageToHighlight: $messageToHighlight,
+								scrollView: scrollView,
+								onInteractionComplete: handleInteractionComplete
+							)
+							.onAppear {
+								// Only mark as read if the app is in the foreground
+								if !message.read && UIApplication.shared.applicationState == .active {
+									message.read = true
+									LocalNotificationManager().cancelNotificationForMessageId(message.messageId)
+									// Race condition, sometimes the app doesn't update unread count if we run this too early
+									// So, run it in the main queue after everything saves and stabilizes
+									DispatchQueue.main.async {
+										markMessagesAsRead()
+										scrollView.scrollTo("bottomAnchor", anchor: .bottom)
 									}
 								}
 							}
-							// Invisible spacer to detect reaching bottom
-							Color.clear
-								.frame(height: 1)
-								.id("bottomAnchor")
-								.onAppear {
-									hasReachedBottom = true
-									showScrollToBottomButton = false
-								}
+
 						}
+						// Invisible spacer to detect reaching bottom
+						Color.clear
+							.frame(height: 1)
+							.id("bottomAnchor")
 					}
-					.scrollDismissesKeyboard(.interactively)
-					.onFirstAppear {
-						if user.unreadMessages == 0 {
-							withAnimation {
-								scrollView.scrollTo("bottomAnchor", anchor: .bottom)
-								hasReachedBottom = true
-							}
-						} else {
-							if let firstUnreadMessageId = user.messageList.first(where: { !$0.read })?.messageId {
-								withAnimation {
-									scrollView.scrollTo(firstUnreadMessageId, anchor: .top)
-									showScrollToBottomButton = true
-								}
-							}
-						}
-						gotFirstUnreadMessage = true
-					}
-					.onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidShowNotification)) { _ in
-						withAnimation {
+				}
+				.defaultScrollAnchor(.bottom)
+				.defaultScrollAnchorTopAlignment()
+				.defaultScrollAnchorBottomSizeChanges()
+				.scrollDismissesKeyboard(.immediately)
+				.onChange(of: messageFieldFocused) {
+					if messageFieldFocused {
+						DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
 							scrollView.scrollTo("bottomAnchor", anchor: .bottom)
-							hasReachedBottom = true
-							showScrollToBottomButton = false
 						}
-					}
-					.onChange(of: user.messageList) {
-						if hasReachedBottom {
-							withAnimation {
-								scrollView.scrollTo("bottomAnchor", anchor: .bottom)
-							}
-						} else {
-							showScrollToBottomButton = true
-						}
-					}
-					// Scroll to bottom button
-					if showScrollToBottomButton {
-						Button {
-							withAnimation {
-								scrollView.scrollTo("bottomAnchor", anchor: .bottom)
-								hasReachedBottom = true
-								showScrollToBottomButton = false
-							}
-						} label: {
-							ScrollToBottomButtonView()
-						}
-						.padding(.bottom, 8)
-						.padding(.trailing, 16)
-						.transition(.opacity)
 					}
 				}
 			}
-
 			TextMessageField(
 				destination: .user(user),
 				replyMessageId: $replyMessageId,
 				isFocused: $messageFieldFocused
-			) {
-				context.refresh(user, mergeChanges: true)
-			}
+			)
 		}
-		.navigationBarTitleDisplayMode(.large)
+		.navigationBarTitleDisplayMode(.inline)
 		.toolbar {
 			if !user.keyMatch {
 				ToolbarItem(placement: .bottomBar) {
@@ -250,6 +157,7 @@ struct UserMessageList: View {
 			ToolbarItem(placement: .principal) {
 				HStack {
 					CircleText(text: user.shortName ?? "?", color: Color(UIColor(hex: UInt32(user.num))), circleSize: 44)
+					Text(user.longName ?? "Unknown").font(.headline)
 				}
 			}
 			ToolbarItem(placement: .navigationBarTrailing) {

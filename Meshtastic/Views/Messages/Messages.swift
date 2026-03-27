@@ -13,16 +13,10 @@ import TipKit
 struct Messages: View {
 
 	@Environment(\.managedObjectContext) var context
-
-	@ObservedObject
-	var router: Router
-
-	@Binding
-	var unreadChannelMessages: Int
-
-	@Binding
-	var unreadDirectMessages: Int
-
+	@Environment(\.colorScheme) private var colorScheme
+	@ObservedObject	var router: Router
+	@Binding var unreadChannelMessages: Int
+	@Binding var unreadDirectMessages: Int
 	@State var node: NodeInfoEntity?
 	@State private var userSelection: UserEntity? // Nothing selected by default.
 	@State private var channelSelection: ChannelEntity? // Nothing selected by default.
@@ -33,37 +27,49 @@ struct Messages: View {
 		NavigationSplitView(columnVisibility: $columnVisibility) {
 			List(selection: $router.navigationState.messages) {
 				NavigationLink(value: MessagesNavigationState.channels()) {
+					Spacer()
 					Label {
 						Text("Channels")
 							.badge(unreadChannelMessages)
 							.font(.title2)
 							.padding()
 					} icon: {
-						Image(systemName: "person.3")
+						Image(systemName: "person.2")
 							.symbolRenderingMode(.hierarchical)
 							.foregroundColor(.accentColor)
 							.font(.title2)
 							.padding()
 					}
 				}
+				.alignmentGuide(.listRowSeparatorLeading) {
+					$0[.leading]
+				}
 				NavigationLink(value: MessagesNavigationState.directMessages()) {
+					Spacer()
 					Label {
 						Text("Direct Messages")
 							.badge(unreadDirectMessages)
 							.font(.title2)
 							.padding()
 					} icon: {
-						Image(systemName: "person.circle")
+						Image(systemName: "person")
 							.symbolRenderingMode(.hierarchical)
 							.foregroundColor(.accentColor)
 							.font(.title2)
 							.padding()
 					}
 				}
-
+				.alignmentGuide(.listRowSeparatorLeading) {
+					$0[.leading]
+				}
+				Spacer()
 				TipView(MessagesTip(), arrowEdge: .top)
 					.tipViewStyle(PersistentTip())
+					.listRowSeparator(.hidden)
+				Spacer()
+					.listRowSeparator(.hidden)
 			}
+			.listStyle(.plain)
 			.navigationTitle("Messages")
 			.navigationBarTitleDisplayMode(.large)
 			.navigationBarItems(leading: MeshtasticLogo())
@@ -71,14 +77,18 @@ struct Messages: View {
 			switch router.navigationState.messages {
 			case .channels(let channelId, let messageId):
 				ChannelList(node: $node, channelSelection: $channelSelection)
+					// Removed navigationTitle and navigationBarTitleDisplayMode here.
+					// ChannelList.swift now handles this within its own NavigationStack.
 			case .directMessages(let userNum, let messageId):
 				UserList(node: $node, userSelection: $userSelection)
+					// Removed navigationTitle here. UserList will handle this.
 			case nil:
 				Text("Select a conversation type")
 			}
 		} detail: {
 			if let myInfo = node?.myInfo, let channelSelection {
 				ChannelMessageList(myInfo: myInfo, channel: channelSelection)
+					// The toolbar is now defined inside ChannelMessageList.swift
 			} else if let userSelection {
 				UserMessageList(user: userSelection)
 			} else if case .channels = router.navigationState.messages {

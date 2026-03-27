@@ -1,16 +1,9 @@
-//
-//  LocalWeatherConditions.swift
-//  Meshtastic
-//
-//  Created by Garth Vander Houwen on 7/9/24.
-//
 import SwiftUI
 import MapKit
 import WeatherKit
 import OSLog
 
 struct LocalWeatherConditions: View {
-	private let gridItemLayout = Array(repeating: GridItem(.flexible(), spacing: 10), count: 2)
 	@State var location: CLLocation?
 	/// Weather
 	/// The current weather condition for the city.
@@ -26,19 +19,49 @@ struct LocalWeatherConditions: View {
 	@State private var symbolName: String = "cloud.fill"
 	@State private var attributionLink: URL?
 	@State private var attributionLogo: URL?
-
 	@Environment(\.colorScheme) var colorScheme: ColorScheme
+
 	var body: some View {
 		if location != nil {
-			VStack {
-				LazyVGrid(columns: gridItemLayout) {
-					WeatherConditionsCompactWidget(temperature: temperature, symbolName: symbolName, description: condition?.description.uppercased() ?? "??")
-					HumidityCompactWidget(humidity: humidity ?? 0, dewPoint: dewPoint)
-					PressureCompactWidget(pressure: String(pressure?.value ?? 0.0 / 100), unit: pressure?.unit.symbol ?? "??", low: pressure?.value ?? 0.0 <= 1009.144)
-					WindCompactWidget(speed: windSpeed, gust: windGust, direction: windCompassDirection)
+			GeometryReader { geometry in
+				VStack(alignment: .center) {
+					// Determine the number of columns based on the screen width
+					let columns = geometry.size.width > 600 ? 4 : 2
+					let gridItemLayout = Array(repeating: GridItem(.flexible(), spacing: 20), count: columns)
+
+					LazyVGrid(columns: gridItemLayout) {
+						WeatherConditionsCompactWidget(temperature: temperature, symbolName: symbolName, description: condition?.description.uppercased() ?? "??")
+							.padding(.bottom, columns == 2 ? 10 : 0)
+						HumidityCompactWidget(humidity: humidity ?? 0, dewPoint: dewPoint)
+							.padding(.bottom, columns == 2 ? 10 : 0)
+						PressureCompactWidget(pressure: String(pressure?.value ?? 0.0 / 100), unit: pressure?.unit.symbol ?? "??", low: pressure?.value ?? 0.0 <= 1009.144)
+						WindCompactWidget(speed: windSpeed, gust: windGust, direction: windCompassDirection)
+					}
+					
+					HStack {
+						AsyncImage(url: attributionLogo) { image in
+							image
+								.resizable()
+								.scaledToFit()
+							    .frame(height: 10)
+						} placeholder: {
+							ProgressView()
+								.controlSize(.mini)
+						}
+						Link("Other data sources", destination: attributionLink ?? URL(string: "https://weather-data.apple.com/legal-attribution.html")!)
+							.font(.caption2)
+					}
+					.offset(y: -2)
+					.padding(.bottom, -15)
 				}
+				.background(
+					// Use GeometryReader here to get the VGrid's height
+					GeometryReader { proxy in
+						// Set the preference key with the VGrid's height
+						Color.clear.preference(key: WeatherKitTilesHeightKey.self, value: proxy.size.height)
+					}
+				)
 			}
-			.padding(.top)
 			.task {
 				do {
 					if location != nil {
@@ -69,33 +92,23 @@ struct LocalWeatherConditions: View {
 					symbolName = "cloud.fill"
 				}
 			}
-			VStack {
-				HStack {
-					AsyncImage(url: attributionLogo) { image in
-						image
-							.resizable()
-							.scaledToFit()
-					} placeholder: {
-						ProgressView()
-							.controlSize(.mini)
-					}
-					.frame(height: 10)
-					Link("Other data sources", destination: attributionLink ?? URL(string: "https://weather-data.apple.com/legal-attribution.html")!)
-						.font(.caption2)
-				}
-				.padding(2)
-			}
 		}
 	}
 }
 
 /// Magnus Formula
-func calculateDewPoint(temp: Float, relativeHumidity: Float) -> Double {
+func calculateDewPoint(temp: Float, relativeHumidity: Float, convertToLocale: Bool = true) -> Double {
 	let a: Float = 17.27
 	let b: Float = 237.7
 	let alpha = ((a * temp) / (b + temp)) + log(relativeHumidity / 100.0)
 	let dewPoint = (b * alpha) / (a - alpha)
 	let dewPointUnit = Measurement<UnitTemperature>(value: Double(dewPoint), unit: .celsius)
+	
+	if !convertToLocale {
+		return Double(dewPoint)
+	}
+	
+	// Otherwise convert to locale units, default behavior
 	let locale = NSLocale.current as NSLocale
 	let localeUnit = locale.object(forKey: NSLocale.Key(rawValue: "kCFLocaleTemperatureUnitKey"))
 	var format: UnitTemperature = .celsius

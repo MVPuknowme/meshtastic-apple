@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import OSLog
 
+@MainActor
 class LocalNotificationManager {
 
     var notifications = [Notification]()
@@ -10,20 +11,23 @@ class LocalNotificationManager {
 	let replyInputAction =  UNTextInputNotificationAction(identifier: "messageNotification.replyInputAction", title: "Reply".localized, options: [])
 
     // Step 1 Request Permissions for notifications
-    private func requestAuthorization() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { granted, error in
-
-            if granted == true && error == nil {
-				self.scheduleNotifications()
+    private func requestAuthorization() async {
+        do {
+            let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound])
+            if granted {
+                self.scheduleNotifications()
             }
+        } catch {
+            Logger.services.error("Error requesting notification authorization: \(error.localizedDescription, privacy: .public)")
         }
     }
 
 	func schedule() {
-        UNUserNotificationCenter.current().getNotificationSettings { settings in
+        Task { @MainActor in
+            let settings = await UNUserNotificationCenter.current().notificationSettings()
             switch settings.authorizationStatus {
             case .notDetermined:
-				self.requestAuthorization()
+                await self.requestAuthorization()
             case .authorized, .provisional:
                 self.scheduleNotifications()
             default:
@@ -91,6 +95,17 @@ class LocalNotificationManager {
         }
     }
 
+	func cancelNotificationForMessageId(_ messageId: Int64) {
+		let center = UNUserNotificationCenter.current()
+		center.getPendingNotificationRequests { notifications in
+			for notification in notifications {
+				if let userInfo = notification.content.userInfo["messageId"] as? Int64, userInfo == messageId {
+					Logger.services.debug("Cancelling notification with id: \(notification.identifier)")
+					UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [notification.identifier])
+				}
+			}
+		}
+	}
 }
 
 struct Notification {
@@ -104,4 +119,10 @@ struct Notification {
 	var channel: Int32?
 	var userNum: Int64?
 	var critical: Bool = false
+}
+
+public func clearNotifications() {
+	let center = UNUserNotificationCenter.current()
+	center.removeAllDeliveredNotifications()
+	center.removeAllPendingNotificationRequests()
 }

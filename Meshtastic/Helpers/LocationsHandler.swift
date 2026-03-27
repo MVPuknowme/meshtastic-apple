@@ -26,6 +26,8 @@ import OSLog
 	@Published var recordingStarted: Date?
 	@Published var distanceTraveled = 0.0
 	@Published var elevationGain = 0.0
+	@Published var heading: Double = 0.0 // Current heading in degrees
+	@Published var headingUpdatesStarted: Bool = false // Track heading updates state
 
 	@Published
 	var updatesStarted: Bool = UserDefaults.standard.bool(forKey: "liveUpdatesStarted") {
@@ -74,12 +76,12 @@ import OSLog
 			// we'll resume the continuation with .notDetermined to prevent a leak.
 			Task { @MainActor in // Ensure this task runs on the MainActor
 				do {
-					try await Task.sleep(for: .seconds(10)) // Wait for 10 seconds
+					try await Task.sleep(for: .seconds(5)) // Wait for 5 seconds
 					if let currentContinuation = self.permissionContinuation {
 						// If the continuation hasn't been nilled out yet, it means
 						// locationManagerDidChangeAuthorization hasn't been called.
 						Logger.services.warning("📍 [App] Location permission request timed out. Resuming continuation with .notDetermined.")
-						currentContinuation.resume(returning: .notDetermined)
+						currentContinuation.resume(returning: .denied)
 						self.permissionContinuation = nil // Clear the reference
 					}
 				} catch is CancellationError {
@@ -131,6 +133,10 @@ import OSLog
 		self.manager.desiredAccuracy = kCLLocationAccuracyBest
 		// Set the distance filter to only receive updates when the device has moved a certain distance.
 		self.manager.distanceFilter = kCLDistanceFilterNone // Receive all updates initially
+		if CLLocationManager.headingAvailable() {
+				self.manager.headingFilter = 1 // Update heading when it changes by 1 degree
+				self.manager.headingOrientation = .portrait // Adjust based on device orientation
+			}
 	}
 
 	func startLocationUpdates() {
@@ -178,6 +184,39 @@ import OSLog
 			// The Task completes implicitly here.
 		}
 	}
+	
+	// New method to start heading updates
+	func startHeadingUpdates() {
+		guard CLLocationManager.headingAvailable() else {
+			Logger.services.warning("📍 [App] Heading updates not available on this device.")
+			return
+		}
+		
+		guard manager.authorizationStatus == .authorizedAlways || manager.authorizationStatus == .authorizedWhenInUse else {
+			Logger.services.warning("📍 [App] Cannot start heading updates: insufficient authorization status.")
+			return
+		}
+		
+		Logger.services.info("📍 [App] Starting heading updates")
+		manager.startUpdatingHeading()
+		headingUpdatesStarted = true
+	}
+
+	// New method to stop heading updates
+	func stopHeadingUpdates() {
+		Logger.services.info("🛑 [App] Stopping heading updates")
+		manager.stopUpdatingHeading()
+		headingUpdatesStarted = false
+	}
+
+	// Implement the CLLocationManagerDelegate method for heading updates
+	func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
+		// Update heading on the main thread
+		Task { @MainActor in
+			self.heading = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
+		}
+	}
+	
 	/// Stops receiving live location updates.
 	func stopLocationUpdates() {
 		Logger.services.info("🛑 [App] Stopping location updates")
@@ -220,50 +259,18 @@ import OSLog
 			// If not recording, only keep the latest location.
 			locationsArray = [location]
 		}
-		// Store the last known location in UserDefaults for persistence.
-		UserDefaults.standard.set(location.coordinate.latitude, forKey: "lastKnownLatitude")
-		UserDefaults.standard.set(location.coordinate.longitude, forKey: "lastKnownLongitude")
-		UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "lastKnownLocationTimestamp")
 		return true
 	}
 	// Default location (Apple Park) used as a fallback.
 	// nonisolated because it is never mutated
 	nonisolated static let DefaultLocation = CLLocationCoordinate2D(latitude: 37.3346, longitude: -122.0090)
 	/// Provides the current location, falling back to last known or a default if necessary.
-	static var currentLocation: CLLocationCoordinate2D {
+	static var currentLocation: CLLocationCoordinate2D? {
 		// Attempt to get the most recent location from the manager.
 		if let location = shared.manager.location {
 			return location.coordinate
 		} else {
-			// If manager.location is nil, check authorization status and potentially request.
-			let status = shared.manager.authorizationStatus
-			switch status {
-			case .notDetermined:
-				Logger.services.info("📍 [App] Location permission not determined, requesting authorization (WhenInUse)")
-				// Requesting WhenInUse authorization here. For "Always" authorization,
-				// `requestLocationAlwaysPermissions()` should be called explicitly,
-				// typically from a user action or app setup.
-				shared.manager.requestWhenInUseAuthorization()
-			case .denied, .restricted:
-				Logger.services.warning("📍 [App] Location access denied or restricted. Please enable location services in Settings to get accurate positioning!")
-				// Requesting WhenInUse authorization again, though user interaction is needed for denied/restricted.
-				shared.manager.requestWhenInUseAuthorization()
-			default:
-				break // For .authorizedAlways, .authorizedWhenInUse, .limited
-			}
-			// Fallback 1: Last known location from UserDefaults if it's recent (within 4 hours).
-			if let lat = UserDefaults.standard.object(forKey: "lastKnownLatitude") as? Double,
-			   let lon = UserDefaults.standard.object(forKey: "lastKnownLongitude") as? Double,
-			   let timestamp = UserDefaults.standard.object(forKey: "lastKnownLocationTimestamp") as? Double,
-			   lat >= -90 && lat <= 90, // Validate latitude
-			   lon >= -180 && lon <= 180, // Validate longitude
-			   Date().timeIntervalSince1970 - timestamp <= 14_400 { // 4 hours in seconds
-				Logger.services.info("📍 [App] Falling back to last known location (age: \(Int(Date().timeIntervalSince1970 - timestamp)) seconds)")
-				return CLLocationCoordinate2D(latitude: lat, longitude: lon)
-			}
-			// Fallback 2: Default location if no other location is available.
-			Logger.services.warning("📍 [App] No Location and no last known location, something is really wrong. Teleporting user to Apple Park")
-			return DefaultLocation
+			return nil
 		}
 	}
 	/// Estimates the number of satellites in view based on horizontal and vertical accuracy.

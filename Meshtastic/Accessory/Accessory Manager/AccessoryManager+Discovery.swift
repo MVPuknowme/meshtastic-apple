@@ -14,11 +14,11 @@ extension AccessoryManager {
 		AsyncStream { continuation in
 			let tasks = transports.map { transport in
 				Task {
-					Logger.transport.info("🔎 [Discovery] Discovery stream started for transport \(String(describing: transport.type))")
-					for await event in transport.discoverDevices() {
+					Logger.transport.info("🔎 [Discovery] Discovery stream started for transport \(String(describing: transport.type), privacy: .public)")
+					for await event in await transport.discoverDevices() {
 						continuation.yield(event)
 					}
-					Logger.transport.info("🔎 [Discovery] Discovery stream closed for transport \(String(describing: transport.type))")
+					Logger.transport.info("🔎 [Discovery] Discovery stream closed for transport \(String(describing: transport.type), privacy: .public)")
 				}
 			}
 			continuation.onTermination = { _ in 
@@ -52,14 +52,18 @@ extension AccessoryManager {
 							existing.rssi = newDevice.rssi
 							self.devices[index] = existing
 						} else {
-							// This is a new device, add it to our list
-							self.devices.append(newDevice)
+							// This is a new device, add it to our list if we are in the foreground
+							if !(self.isInBackground) {
+								self.devices.append(newDevice)
+							} else {
+								Logger.transport.debug("🔎 [Discovery] Found a new device but not in the foreground, not adding to our list: peripheral \(newDevice.name)")
+							}
 						}
 						
-						if self.shouldAutomaticallyConnectToPreferredPeripheral,
+						if self.shouldAutomaticallyConnectToPreferredPeripheralAfterError, !userRequestedConnectionCancellation,
 						   UserDefaults.autoconnectOnDiscovery, UserDefaults.preferredPeripheralId == newDevice.id.uuidString {
 							Logger.transport.debug("🔎 [Discovery] Found preferred peripheral \(newDevice.name)")
-							self.connectToPreferredDevice()
+							self.connectToPreferredDevice(device: newDevice)
 						}
 						
 						// Update the list of discovered devices on the main thread for presentation
@@ -67,7 +71,7 @@ extension AccessoryManager {
 						self.devices = devices.sorted { $0.name < $1.name }
 						
 					case .deviceLost(let deviceId):
-						devices.removeAll { $0.id == deviceId }
+						devices = devices.filter { $0.id != deviceId }
 					
 					case .deviceReportedRssi(let deviceId, let newRssi):
 						updateDevice(deviceId: deviceId, key: \.rssi, value: newRssi)

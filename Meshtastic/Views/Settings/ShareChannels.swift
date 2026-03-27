@@ -55,7 +55,10 @@ struct ShareChannels: View {
 
 		VStack {
 			TipView(ShareChannelsTip(), arrowEdge: .bottom)
+				.tipBackground(Color(.secondarySystemBackground))
+				.listRowSeparator(.hidden)
 		}
+		.padding(.horizontal)
 		GeometryReader { bounds in
 			let smallest = min(bounds.size.width, bounds.size.height)
 			ScrollView {
@@ -280,6 +283,7 @@ struct ShareChannels: View {
 		loRaConfig.channelNum = UInt32(node?.loRaConfig?.channelNum ?? 0)
 		loRaConfig.sx126XRxBoostedGain = node?.loRaConfig?.sx126xRxBoostedGain ?? false
 		loRaConfig.ignoreMqtt = node?.loRaConfig?.ignoreMqtt ?? false
+		loRaConfig.overrideFrequency = node?.loRaConfig?.overrideFrequency ?? 0.0
 		channelSet.loraConfig = loRaConfig
 		if node?.myInfo?.channels != nil && node?.myInfo?.channels?.count ?? 0 > 0 {
 			for ch in node?.myInfo?.channels?.array as? [ChannelEntity] ?? [] where ch.role > 0 {
