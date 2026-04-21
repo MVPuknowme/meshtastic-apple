@@ -7,6 +7,6 @@
   <Contents>
     <Content ignore="false" zipEntry="taky-server.pref"/>
     <Content ignore="false" zipEntry="server.p12"/>
-    <Content ignore="false" zipEntry="iphone.p12"/>
+    <Content ignore="?" zipEntry="iphone.p12"/>
   </Contents>
 </MissionPackageManifest>
