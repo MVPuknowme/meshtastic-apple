@@ -60,5 +60,5 @@ if [[ -e "${SWIFT_LINT}" ]]; then
 
 else
     echo "SwiftLint not installed. Please install from https://github.com/realm/SwiftLint"
-    exit -1
+    exit 23
 fi
