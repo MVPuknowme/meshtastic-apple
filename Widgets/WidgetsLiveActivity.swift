@@ -306,4 +306,4 @@ struct ExpandedTrailingView: View {
 		.tint(Color("LightIndigo"))
 	}
 }
-#endif
+#end
