@@ -5,6 +5,7 @@
 
 import SwiftUI
 import CoreData
+import Foundation
 
 struct SkyGridRedundancyView: View {
     @FetchRequest(
@@ -12,6 +13,9 @@ struct SkyGridRedundancyView: View {
         animation: .default
     )
     private var nodes: FetchedResults<NodeInfoEntity>
+
+    @AppStorage("skygridAWSEndpoint") private var awsEndpoint = ""
+    @State private var sendStatus = SkyGridSendStatus.idle
 
     private var activeCutoff: Date {
         Calendar.current.date(byAdding: .minute, value: -120, to: Date()) ?? Date()
@@ -44,7 +48,8 @@ struct SkyGridRedundancyView: View {
         guard !visibleNodes.isEmpty else { return 0 }
         let activeRatio = Double(activeNodes.count) / Double(visibleNodes.count)
         let routeBonus = (!loraNodes.isEmpty && !mqttNodes.isEmpty) ? 0.20 : 0.0
-        return min(100, Int((activeRatio + routeBonus) * 100.0))
+        let sendBonus = sendStatus.isSuccessful ? 0.10 : 0.0
+        return min(100, Int((activeRatio + routeBonus + sendBonus) * 100.0))
     }
 
     private var layers: [SkyGridLayer] {
@@ -64,11 +69,11 @@ struct SkyGridRedundancyView: View {
                 detail: "Apple devices receive mesh data over Bluetooth, keep a local copy, and forward updates over Wi-Fi or cellular when available."
             ),
             SkyGridLayer(
-                title: "Cloud Sync Layer",
-                subtitle: "MQTT and sync visibility",
+                title: "AWS Send Layer",
+                subtitle: "HTTPS packet bridge",
                 icon: "cloud.fill",
-                status: "\(mqttNodes.count) MQTT node\(mqttNodes.count == 1 ? "" : "s") observed",
-                detail: "Cloud-facing routes can be reviewed through MQTT-visible nodes and stored sync state."
+                status: sendStatus.summary,
+                detail: "Sends a minimal diagnostic packet to the configured SkyGrid AWS ingest endpoint. No credentials are stored here."
             ),
             SkyGridLayer(
                 title: "Dashboard Layer",
@@ -83,7 +88,8 @@ struct SkyGridRedundancyView: View {
     private var routes: [SkyGridRoute] {
         [
             SkyGridRoute(name: "Mesh route", value: "\(loraNodes.count) LoRa path node\(loraNodes.count == 1 ? "" : "s")"),
-            SkyGridRoute(name: "Direct route", value: "\(mqttNodes.count) MQTT-visible node\(mqttNodes.count == 1 ? "" : "s")"),
+            SkyGridRoute(name: "MQTT route", value: "\(mqttNodes.count) MQTT-visible node\(mqttNodes.count == 1 ? "" : "s")"),
+            SkyGridRoute(name: "AWS send route", value: sendStatus.routeValue),
             SkyGridRoute(name: "Offline route", value: "\(max(visibleNodes.count - activeNodes.count, 0)) cached or stale node\(max(visibleNodes.count - activeNodes.count, 0) == 1 ? "" : "s")"),
             SkyGridRoute(name: "Record route", value: "\(visibleNodes.count) total visible node\(visibleNodes.count == 1 ? "" : "s")")
         ]
@@ -94,6 +100,7 @@ struct SkyGridRedundancyView: View {
             VStack(alignment: .leading, spacing: 16) {
                 header
                 liveSummary
+                awsSendPanel
                 rules
                 layerMap
                 routeMap
@@ -110,7 +117,7 @@ struct SkyGridRedundancyView: View {
                 .font(.title2)
                 .fontWeight(.semibold)
 
-            Text("Live read-only mesh status using local Meshtastic node data.")
+            Text("Live mesh status plus a safe AWS test-packet sender.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
         }
@@ -129,6 +136,34 @@ struct SkyGridRedundancyView: View {
         }
     }
 
+    private var awsSendPanel: some View {
+        SkyGridPanel(title: "AWS Packet Sender") {
+            TextField("https://example.com/mesh/ingest", text: $awsEndpoint)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled(true)
+                .keyboardType(.URL)
+                .textFieldStyle(.roundedBorder)
+
+            HStack(spacing: 10) {
+                SkyGridMetricCard(title: "Send", value: sendStatus.badge, icon: "paperplane.fill")
+                SkyGridMetricCard(title: "HTTP", value: sendStatus.httpCodeText, icon: "server.rack")
+                SkyGridMetricCard(title: "Packet", value: "Test", icon: "shippingbox.fill")
+            }
+
+            Button {
+                Task {
+                    await sendDiagnosticPacket()
+                }
+            } label: {
+                Label("Send Test Packet", systemImage: "paperplane")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(awsEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sendStatus.isSending)
+
+            SkyGridRuleRow(title: "Status", value: sendStatus.detail)
+        }
+    }
+
     private var latestNodeLastHeardText: String {
         guard let latestNode, let lastHeard = latestNode.lastHeard else {
             return "No node history available"
@@ -142,7 +177,7 @@ struct SkyGridRedundancyView: View {
         SkyGridPanel(title: "Redundancy Rules") {
             SkyGridRuleRow(title: "Message ID", value: "hash(nodeId + timestamp + payload)")
             SkyGridRuleRow(title: "Duplicate policy", value: "Ignore identical packet hashes")
-            SkyGridRuleRow(title: "Confidence", value: "Increase route score when active nodes are present across LoRa and MQTT paths")
+            SkyGridRuleRow(title: "Confidence", value: "Increase route score when active nodes are present across LoRa, MQTT, and AWS send paths")
             SkyGridRuleRow(title: "Fallback", value: "Store locally until sync is available")
         }
     }
@@ -186,10 +221,146 @@ struct SkyGridRedundancyView: View {
 
     private var reviewChecklist: some View {
         SkyGridPanel(title: "Codex Review Checklist") {
-            SkyGridRuleRow(title: "Architecture", value: "Live SwiftUI view backed by local CoreData node records.")
-            SkyGridRuleRow(title: "Security", value: "No secrets, keys, certificates, credentials, or packet mutation included.")
-            SkyGridRuleRow(title: "Compatibility", value: "Uses SwiftUI, CoreData fetch, SF Symbols, and standard system materials.")
-            SkyGridRuleRow(title: "Next step", value: "Add a navigation route from settings, diagnostics, or node visibility.")
+            SkyGridRuleRow(title: "Architecture", value: "Live SwiftUI view backed by local CoreData node records and a configurable HTTPS sender.")
+            SkyGridRuleRow(title: "Security", value: "No secrets, keys, certificates, credentials, or private mesh payload forwarding included.")
+            SkyGridRuleRow(title: "Compatibility", value: "Uses SwiftUI, CoreData fetch, URLSession, SF Symbols, and system materials.")
+            SkyGridRuleRow(title: "Next step", value: "Point the AWS field at your SkyGrid bridge /mesh/ingest endpoint.")
+        }
+    }
+
+    @MainActor
+    private func setSendStatus(_ status: SkyGridSendStatus) {
+        sendStatus = status
+    }
+
+    private func sendDiagnosticPacket() async {
+        let trimmedEndpoint = awsEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedEndpoint.isEmpty else {
+            await setSendStatus(.failed("No AWS ingest endpoint configured"))
+            return
+        }
+
+        guard let url = URL(string: trimmedEndpoint), ["https", "http"].contains(url.scheme?.lowercased()) else {
+            await setSendStatus(.failed("Invalid endpoint URL"))
+            return
+        }
+
+        await setSendStatus(.sending)
+
+        do {
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.timeoutInterval = 10
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+            let packet = buildDiagnosticPacket()
+            request.httpBody = try JSONSerialization.data(withJSONObject: packet, options: [])
+
+            let (_, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                await setSendStatus(.failed("No HTTP response"))
+                return
+            }
+
+            if 200..<300 ~= httpResponse.statusCode {
+                await setSendStatus(.sent(code: httpResponse.statusCode, checkedAt: Date()))
+            } else {
+                await setSendStatus(.rejected(code: httpResponse.statusCode, checkedAt: Date()))
+            }
+        } catch {
+            await setSendStatus(.failed(error.localizedDescription))
+        }
+    }
+
+    private func buildDiagnosticPacket() -> [String: Any] {
+        let latestNodeName = latestNode?.user?.longName ?? latestNode?.user?.shortName ?? "unknown"
+        let latestNodeId = latestNode?.num ?? 0
+
+        return [
+            "type": "skygrid.diagnostic",
+            "schemaVersion": 1,
+            "source": "meshtastic-apple",
+            "createdAt": ISO8601DateFormatter().string(from: Date()),
+            "nodeSummary": [
+                "visible": visibleNodes.count,
+                "active": activeNodes.count,
+                "lora": loraNodes.count,
+                "mqtt": mqttNodes.count,
+                "latestNodeId": latestNodeId,
+                "latestNodeName": latestNodeName
+            ],
+            "routeConfidence": confidenceScore
+        ]
+    }
+}
+
+private enum SkyGridSendStatus: Equatable {
+    case idle
+    case sending
+    case sent(code: Int, checkedAt: Date)
+    case rejected(code: Int, checkedAt: Date)
+    case failed(String)
+
+    var isSending: Bool {
+        if case .sending = self { return true }
+        return false
+    }
+
+    var isSuccessful: Bool {
+        if case .sent = self { return true }
+        return false
+    }
+
+    var badge: String {
+        switch self {
+        case .idle: return "Idle"
+        case .sending: return "Sending"
+        case .sent: return "Sent"
+        case .rejected: return "Rejected"
+        case .failed: return "Failed"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .idle: return "AWS sender idle"
+        case .sending: return "Sending diagnostic packet"
+        case .sent(let code, _): return "AWS accepted packet (HTTP \(code))"
+        case .rejected(let code, _): return "AWS rejected packet (HTTP \(code))"
+        case .failed: return "AWS send failed"
+        }
+    }
+
+    var routeValue: String {
+        switch self {
+        case .idle: return "Not sent yet"
+        case .sending: return "Sending diagnostic packet"
+        case .sent(let code, _): return "Packet accepted through HTTPS bridge (HTTP \(code))"
+        case .rejected(let code, _): return "Endpoint reachable but rejected packet (HTTP \(code))"
+        case .failed(let message): return "Send failed: \(message)"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .idle:
+            return "Enter a SkyGrid AWS ingest URL and send a test packet."
+        case .sending:
+            return "Sending a minimal diagnostic packet."
+        case .sent(let code, let checkedAt):
+            return "Packet accepted with HTTP \(code) at \(checkedAt.formatted(date: .abbreviated, time: .standard))."
+        case .rejected(let code, let checkedAt):
+            return "Endpoint responded with HTTP \(code) at \(checkedAt.formatted(date: .abbreviated, time: .standard))."
+        case .failed(let message):
+            return message
+        }
+    }
+
+    var httpCodeText: String {
+        switch self {
+        case .sent(let code, _), .rejected(let code, _): return "\(code)"
+        default: return "—"
         }
     }
 }
