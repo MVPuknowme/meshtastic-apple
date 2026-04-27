@@ -4,50 +4,96 @@
 //
 
 import SwiftUI
+import CoreData
 
 struct SkyGridRedundancyView: View {
-    private let layers: [SkyGridLayer] = [
-        SkyGridLayer(
-            title: "Field Layer",
-            subtitle: "Meshtastic LoRa nodes",
-            icon: "antenna.radiowaves.left.and.right",
-            status: "Offline relay",
-            detail: "LoRa nodes forward compact packets and position signals when internet access is unavailable."
-        ),
-        SkyGridLayer(
-            title: "Apple Edge Layer",
-            subtitle: "iPhone, iPad, and Mac bridge",
-            icon: "iphone.radiowaves.left.and.right",
-            status: "Cache and uplink",
-            detail: "Apple devices receive mesh data over Bluetooth, keep a local copy, and forward updates over Wi-Fi or cellular when available."
-        ),
-        SkyGridLayer(
-            title: "Cloud Sync Layer",
-            subtitle: "IoT ingest, processing, and storage",
-            icon: "cloud.fill",
-            status: "Canonical record",
-            detail: "Cloud services normalize packets, calculate hashes, remove duplicates, and preserve sync records."
-        ),
-        SkyGridLayer(
-            title: "Dashboard Layer",
-            subtitle: "Node visibility and review",
-            icon: "point.3.connected.trianglepath.dotted",
-            status: "Read-only overview",
-            detail: "The dashboard presents node health, last-seen state, route confidence, and sync status."
-        )
-    ]
+    @FetchRequest(
+        sortDescriptors: [NSSortDescriptor(key: "lastHeard", ascending: false)],
+        animation: .default
+    )
+    private var nodes: FetchedResults<NodeInfoEntity>
 
-    private let routes: [SkyGridRoute] = [
-        SkyGridRoute(name: "Mesh route", value: "Node → Node → Apple device → Cloud"),
-        SkyGridRoute(name: "Direct route", value: "Apple device → Wi-Fi or cellular → Cloud"),
-        SkyGridRoute(name: "Offline route", value: "Apple local cache → Sync later"),
-        SkyGridRoute(name: "Record route", value: "Ingest → Normalize → Store → Display")
-    ]
+    private var activeCutoff: Date {
+        Calendar.current.date(byAdding: .minute, value: -120, to: Date()) ?? Date()
+    }
+
+    private var visibleNodes: [NodeInfoEntity] {
+        nodes.filter { !$0.ignored }
+    }
+
+    private var activeNodes: [NodeInfoEntity] {
+        visibleNodes.filter { node in
+            guard let lastHeard = node.lastHeard else { return false }
+            return lastHeard >= activeCutoff
+        }
+    }
+
+    private var loraNodes: [NodeInfoEntity] {
+        visibleNodes.filter { !$0.viaMqtt }
+    }
+
+    private var mqttNodes: [NodeInfoEntity] {
+        visibleNodes.filter { $0.viaMqtt }
+    }
+
+    private var latestNode: NodeInfoEntity? {
+        visibleNodes.first
+    }
+
+    private var confidenceScore: Int {
+        guard !visibleNodes.isEmpty else { return 0 }
+        let activeRatio = Double(activeNodes.count) / Double(visibleNodes.count)
+        let routeBonus = (!loraNodes.isEmpty && !mqttNodes.isEmpty) ? 0.20 : 0.0
+        return min(100, Int((activeRatio + routeBonus) * 100.0))
+    }
+
+    private var layers: [SkyGridLayer] {
+        [
+            SkyGridLayer(
+                title: "Field Layer",
+                subtitle: "Meshtastic LoRa nodes",
+                icon: "antenna.radiowaves.left.and.right",
+                status: "\(loraNodes.count) LoRa node\(loraNodes.count == 1 ? "" : "s") observed",
+                detail: "LoRa nodes forward compact packets and position signals when internet access is unavailable."
+            ),
+            SkyGridLayer(
+                title: "Apple Edge Layer",
+                subtitle: "iPhone, iPad, and Mac bridge",
+                icon: "iphone.radiowaves.left.and.right",
+                status: "\(activeNodes.count) active node\(activeNodes.count == 1 ? "" : "s") in the last 120 minutes",
+                detail: "Apple devices receive mesh data over Bluetooth, keep a local copy, and forward updates over Wi-Fi or cellular when available."
+            ),
+            SkyGridLayer(
+                title: "Cloud Sync Layer",
+                subtitle: "MQTT and sync visibility",
+                icon: "cloud.fill",
+                status: "\(mqttNodes.count) MQTT node\(mqttNodes.count == 1 ? "" : "s") observed",
+                detail: "Cloud-facing routes can be reviewed through MQTT-visible nodes and stored sync state."
+            ),
+            SkyGridLayer(
+                title: "Dashboard Layer",
+                subtitle: "Node visibility and review",
+                icon: "point.3.connected.trianglepath.dotted",
+                status: "\(confidenceScore)% route confidence",
+                detail: "The dashboard presents node health, last-seen state, route confidence, and sync status."
+            )
+        ]
+    }
+
+    private var routes: [SkyGridRoute] {
+        [
+            SkyGridRoute(name: "Mesh route", value: "\(loraNodes.count) LoRa path node\(loraNodes.count == 1 ? "" : "s")"),
+            SkyGridRoute(name: "Direct route", value: "\(mqttNodes.count) MQTT-visible node\(mqttNodes.count == 1 ? "" : "s")"),
+            SkyGridRoute(name: "Offline route", value: "\(max(visibleNodes.count - activeNodes.count, 0)) cached or stale node\(max(visibleNodes.count - activeNodes.count, 0) == 1 ? "" : "s")"),
+            SkyGridRoute(name: "Record route", value: "\(visibleNodes.count) total visible node\(visibleNodes.count == 1 ? "" : "s")")
+        ]
+    }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 header
+                liveSummary
                 rules
                 layerMap
                 routeMap
@@ -64,18 +110,39 @@ struct SkyGridRedundancyView: View {
                 .font(.title2)
                 .fontWeight(.semibold)
 
-            Text("A read-only map for LoRa mesh relay, Apple edge caching, cloud sync, and dashboard visibility.")
+            Text("Live read-only mesh status using local Meshtastic node data.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    private var liveSummary: some View {
+        SkyGridPanel(title: "Live Mesh Summary") {
+            HStack(spacing: 10) {
+                SkyGridMetricCard(title: "Nodes", value: "\(visibleNodes.count)", icon: "circle.hexagongrid.fill")
+                SkyGridMetricCard(title: "Active", value: "\(activeNodes.count)", icon: "bolt.horizontal.circle.fill")
+                SkyGridMetricCard(title: "Confidence", value: "\(confidenceScore)%", icon: "checkmark.seal.fill")
+            }
+
+            SkyGridRuleRow(title: "Last heard", value: latestNodeLastHeardText)
+        }
+    }
+
+    private var latestNodeLastHeardText: String {
+        guard let latestNode, let lastHeard = latestNode.lastHeard else {
+            return "No node history available"
+        }
+
+        let nodeName = latestNode.user?.longName ?? latestNode.user?.shortName ?? latestNode.num.formatted()
+        return "\(nodeName) at \(lastHeard.formatted(date: .abbreviated, time: .shortened))"
+    }
+
     private var rules: some View {
         SkyGridPanel(title: "Redundancy Rules") {
             SkyGridRuleRow(title: "Message ID", value: "hash(nodeId + timestamp + payload)")
             SkyGridRuleRow(title: "Duplicate policy", value: "Ignore identical packet hashes")
-            SkyGridRuleRow(title: "Confidence", value: "Increase route score when a packet arrives through more than one path")
+            SkyGridRuleRow(title: "Confidence", value: "Increase route score when active nodes are present across LoRa and MQTT paths")
             SkyGridRuleRow(title: "Fallback", value: "Store locally until sync is available")
         }
     }
@@ -119,10 +186,10 @@ struct SkyGridRedundancyView: View {
 
     private var reviewChecklist: some View {
         SkyGridPanel(title: "Codex Review Checklist") {
-            SkyGridRuleRow(title: "Architecture", value: "Contained SwiftUI view; no packet transport behavior changed.")
-            SkyGridRuleRow(title: "Security", value: "No secrets, keys, certificates, or credentials included.")
-            SkyGridRuleRow(title: "Compatibility", value: "Uses SwiftUI, SF Symbols, and standard system materials.")
-            SkyGridRuleRow(title: "Next step", value: "Add this view to a settings, diagnostics, or node-visibility navigation route.")
+            SkyGridRuleRow(title: "Architecture", value: "Live SwiftUI view backed by local CoreData node records.")
+            SkyGridRuleRow(title: "Security", value: "No secrets, keys, certificates, credentials, or packet mutation included.")
+            SkyGridRuleRow(title: "Compatibility", value: "Uses SwiftUI, CoreData fetch, SF Symbols, and standard system materials.")
+            SkyGridRuleRow(title: "Next step", value: "Add a navigation route from settings, diagnostics, or node visibility.")
         }
     }
 }
@@ -141,6 +208,30 @@ private struct SkyGridPanel<Content: View>: View {
         .padding()
         .background(.thinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+}
+
+private struct SkyGridMetricCard: View {
+    let title: String
+    let value: String
+    let icon: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Image(systemName: icon)
+                .font(.caption)
+                .foregroundStyle(.tint)
+            Text(value)
+                .font(.headline)
+                .fontWeight(.semibold)
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 
